@@ -1,0 +1,297 @@
+# .github/workflows/anomaly_detection.yml
+#
+# Workflow: Train & Score (Anomaly Detection)
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+#   • Push / PR on main → full train + score pipeline
+#   • Manual dispatch  → choose action (train | score | both) and override params
+#
+# Required GitHub Secrets
+#   AZURE_CREDENTIALS      – Service principal JSON (az ad sp create-for-rbac …)
+#   AML_WORKSPACE          – Azure ML workspace name
+#   AML_RESOURCE_GROUP     – Resource group
+#   AML_SUBSCRIPTION_ID    – Azure subscription ID
+#   AML_COMPUTE_TARGET     – Compute cluster name (e.g. gpu-cluster)
+#   AML_DATASTORE_PATH     – Registered datastore URI for MVTecAD
+#                            (e.g. azureml://datastores/mvtec/paths/mvtec-ad)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Anomaly Detection — Train & Score
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "train.py"
+      - "score.py"
+      - "requirements.txt"
+      - ".github/workflows/anomaly_detection.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Pipeline step to run"
+        required: true
+        default: "both"
+        type: choice
+        options: [train, score, both]
+      category:
+        description: "MVTecAD category"
+        default: "bottle"
+      epochs:
+        description: "Training epochs"
+        default: "1"
+      export_format:
+        description: "Export format"
+        default: "onnx"
+        type: choice
+        options: [onnx, torch, openvino]
+      ckpt_path:
+        description: "Checkpoint path (score step only)"
+        default: "outputs/weights/lightning/model.ckpt"
+
+env:
+  PYTHON_VERSION: "3.10"
+  CATEGORY:       ${{ github.event.inputs.category      || 'bottle' }}
+  EPOCHS:         ${{ github.event.inputs.epochs         || '1' }}
+  EXPORT_FORMAT:  ${{ github.event.inputs.export_format  || 'onnx' }}
+  CKPT_PATH:      ${{ github.event.inputs.ckpt_path      || 'outputs/weights/lightning/model.ckpt' }}
+
+jobs:
+  # ─── 1. Lint & static checks (runs on every push / PR, no GPU needed) ─────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check train.py score.py
+
+  # ─── 2. Train on Azure ML ─────────────────────────────────────────────────
+  train:
+    name: Train (Azure ML)
+    runs-on: ubuntu-latest
+    needs: lint
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.action == 'train'    ||
+      github.event.inputs.action == 'both'
+    environment: azure-ml        # optional: require approval in prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Azure ML SDK v2
+        run: pip install azure-ai-ml azure-identity
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Submit training job to Azure ML
+        id: train_job
+        run: |
+          python - <<'PYEOF'
+          import json
+          from azure.ai.ml import MLClient, command, Input
+          from azure.ai.ml.entities import Environment
+          from azure.identity import DefaultAzureCredential
+
+          ml = MLClient(
+              DefaultAzureCredential(),
+              subscription_id="${{ secrets.AML_SUBSCRIPTION_ID }}",
+              resource_group_name="${{ secrets.AML_RESOURCE_GROUP }}",
+              workspace_name="${{ secrets.AML_WORKSPACE }}",
+          )
+
+          job = command(
+              code=".",                               # uploads repo root
+              command=(
+                  "pip install anomalib openvino --quiet && "
+                  "python train.py "
+                  "  --category ${{ env.CATEGORY }} "
+                  "  --data-root $INPUT_DATA "
+                  "  --output-dir ./outputs "
+                  "  --epochs ${{ env.EPOCHS }} "
+                  "  --export-format ${{ env.EXPORT_FORMAT }}"
+              ),
+              inputs={
+                  "INPUT_DATA": Input(
+                      type="uri_folder",
+                      path="${{ secrets.AML_DATASTORE_PATH }}",
+                  )
+              },
+              environment="azureml:AzureML-sklearn-1.5-ubuntu20.04-py38-cpu@latest",
+              compute="${{ secrets.AML_COMPUTE_TARGET }}",
+              display_name="patchcore-train-${{ env.CATEGORY }}",
+              experiment_name="anomaly-detection",
+              outputs={},            # outputs auto-uploaded to default datastore
+          )
+
+          returned = ml.jobs.create_or_update(job)
+          print(f"Job submitted: {returned.name}")
+          print(f"Studio URL:    {returned.studio_url}")
+
+          # Expose job name to downstream steps
+          import os
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"job_name={returned.name}\n")
+          PYEOF
+
+      - name: Wait for training job to complete
+        run: |
+          python - <<'PYEOF'
+          from azure.ai.ml import MLClient
+          from azure.identity import DefaultAzureCredential
+          import time, sys
+
+          ml = MLClient(
+              DefaultAzureCredential(),
+              "${{ secrets.AML_SUBSCRIPTION_ID }}",
+              "${{ secrets.AML_RESOURCE_GROUP }}",
+              "${{ secrets.AML_WORKSPACE }}",
+          )
+
+          job_name = "${{ steps.train_job.outputs.job_name }}"
+          poll_sec = 30
+          timeout  = 7200          # 2 h
+
+          elapsed = 0
+          while elapsed < timeout:
+              job = ml.jobs.get(job_name)
+              status = job.status
+              print(f"[{elapsed}s] Status: {status}")
+              if status in ("Completed", "Succeeded"):
+                  sys.exit(0)
+              if status in ("Failed", "Canceled", "CancelRequested"):
+                  print("Job failed:", status)
+                  sys.exit(1)
+              time.sleep(poll_sec)
+              elapsed += poll_sec
+
+          print("Timeout waiting for job")
+          sys.exit(1)
+          PYEOF
+
+      - name: Download training outputs
+        run: |
+          python - <<'PYEOF'
+          from azure.ai.ml import MLClient
+          from azure.identity import DefaultAzureCredential
+
+          ml = MLClient(
+              DefaultAzureCredential(),
+              "${{ secrets.AML_SUBSCRIPTION_ID }}",
+              "${{ secrets.AML_RESOURCE_GROUP }}",
+              "${{ secrets.AML_WORKSPACE }}",
+          )
+          ml.jobs.download(
+              "${{ steps.train_job.outputs.job_name }}",
+              download_path="./aml_outputs",
+          )
+          PYEOF
+
+      - name: Upload checkpoint artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-checkpoint
+          path: aml_outputs/
+          retention-days: 30
+
+      - name: Upload metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-metrics
+          path: aml_outputs/**/metrics.json
+          if-no-files-found: warn
+
+  # ─── 3. Score / inference ─────────────────────────────────────────────────
+  score:
+    name: Score (Azure ML)
+    runs-on: ubuntu-latest
+    needs: train
+    if: >
+      (
+        github.event_name != 'workflow_dispatch' ||
+        github.event.inputs.action == 'score'   ||
+        github.event.inputs.action == 'both'
+      ) && always() && needs.train.result != 'failure'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Azure ML SDK v2
+        run: pip install azure-ai-ml azure-identity
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Download checkpoint (if produced in same run)
+        if: needs.train.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: model-checkpoint
+          path: aml_outputs/
+
+      - name: Submit scoring job to Azure ML
+        run: |
+          python - <<'PYEOF'
+          from azure.ai.ml import MLClient, command, Input
+          from azure.identity import DefaultAzureCredential
+
+          ml = MLClient(
+              DefaultAzureCredential(),
+              "${{ secrets.AML_SUBSCRIPTION_ID }}",
+              "${{ secrets.AML_RESOURCE_GROUP }}",
+              "${{ secrets.AML_WORKSPACE }}",
+          )
+
+          job = command(
+              code=".",
+              command=(
+                  "pip install anomalib --quiet && "
+                  "python score.py "
+                  "  --input $INPUT_IMAGES "
+                  "  --ckpt ${{ env.CKPT_PATH }} "
+                  "  --output-dir ./outputs/predictions "
+                  "  --save-maps"
+              ),
+              inputs={
+                  "INPUT_IMAGES": Input(
+                      type="uri_folder",
+                      path="${{ secrets.AML_DATASTORE_PATH }}/${{ env.CATEGORY }}/test",
+                  )
+              },
+              environment="azureml:AzureML-sklearn-1.5-ubuntu20.04-py38-cpu@latest",
+              compute="${{ secrets.AML_COMPUTE_TARGET }}",
+              display_name="patchcore-score-${{ env.CATEGORY }}",
+              experiment_name="anomaly-detection",
+          )
+
+          returned = ml.jobs.create_or_update(job)
+          print(f"Scoring job: {returned.name}")
+          print(f"Studio URL:  {returned.studio_url}")
+          PYEOF
