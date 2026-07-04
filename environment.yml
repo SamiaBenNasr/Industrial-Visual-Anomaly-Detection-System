@@ -1,0 +1,13 @@
+$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: patchcore-env
+image: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest
+inference_config:
+  liveness_route:
+    path: /health
+    port: 8080
+  readiness_route:
+    path: /health
+    port: 8080
+  scoring_route:
+    path: /score
+    port: 8080

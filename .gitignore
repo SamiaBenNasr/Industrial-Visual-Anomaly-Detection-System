@@ -7,3 +7,6 @@ data/
 *.pyc
 results/
 outputs/
+
+help/
+hf_cache/
