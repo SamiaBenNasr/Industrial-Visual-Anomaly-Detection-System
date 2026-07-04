@@ -1,5 +1,3 @@
-
-
 # Stage 1 — base commune
 FROM python:3.11-slim AS base
 
@@ -40,6 +38,20 @@ RUN find /usr/local -name '*.pyc' -delete \
  && find /usr/local -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true \
  && find /usr/local/lib/python3.11/site-packages -name 'tests' -type d -exec rm -rf {} + 2>/dev/null || true
 
+# Download the backbone weights at build time by instantiating Patchcore()
+# exactly as done locally. This works regardless of whether timm resolves
+# the weights via torch.hub or the HuggingFace Hub under the hood --
+# we don't need to guess a repo_id, we just capture whatever cache dirs
+# get populated.
+ENV TORCH_HOME=/app/.cache/torch \
+    HF_HOME=/app/.cache/hf \
+    HF_HUB_OFFLINE=0
+RUN mkdir -p /app/.cache/torch /app/.cache/hf \
+ && python -c "\
+from anomalib.models import Patchcore; \
+Patchcore(); \
+print('Poids telecharges dans /app/.cache')"
+
 
 # Stage 3 — image finale
 FROM base AS runtime
@@ -47,13 +59,12 @@ FROM base AS runtime
 WORKDIR /app
 
 COPY --from=builder /usr/local /usr/local
+COPY --from=builder /app/.cache/torch /app/.cache/torch
+COPY --from=builder /app/.cache/hf /app/.cache/hf
 
-COPY hf_cache/hf /app/.cache/huggingface
-
-ENV HF_HOME=/app/.cache/huggingface \
+ENV TORCH_HOME=/app/.cache/torch \
+    HF_HOME=/app/.cache/hf \
     HF_HUB_OFFLINE=1
-
-
 
 COPY endpoint_score.py ./endpoint_score.py
 COPY server.py ./server.py
