@@ -1,0 +1,100 @@
+name: Build and Deploy PatchCore to Azure ML
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'score.py'
+      - 'deployment.yml'
+      - 'environment.yml'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:  
+
+env:
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  IMAGE_NAME: patchcore-inference
+  RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
+  WORKSPACE_NAME: ${{ secrets.WORKSPACE_NAME }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set image tag (git SHA)
+        id: vars
+        run: echo "image_tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: ACR login
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }} \
+                        -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest .
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install azure-ml CLI extension
+        run: az extension add -n ml -y
+
+      - name: Update environment with new image tag
+        run: |
+          cat <<EOF > environment.generated.yml
+          \$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+          name: patchcore-env
+          image: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}
+          inference_config:
+            liveness_route:
+              path: /health
+              port: 8080
+            readiness_route:
+              path: /health
+              port: 8080
+            scoring_route:
+              path: /score
+              port: 8080
+          EOF
+          az ml environment create --file environment.generated.yml \
+            --workspace-name ${{ env.WORKSPACE_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }}
+
+      - name: Update deployment to use new environment version
+        run: |
+          az ml online-deployment update \
+            --file deployment.yml \
+            --workspace-name ${{ env.WORKSPACE_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }}
+
+      - name: Smoke test the endpoint
+        run: |
+          az ml online-endpoint invoke \
+            --name patchcore-endpoint \
+            --request-file test-request.json \
+            --workspace-name ${{ env.WORKSPACE_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }}
