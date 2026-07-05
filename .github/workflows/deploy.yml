@@ -36,6 +36,7 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+          allow-no-subscriptions: true
 
       - name: ACR login
         run: az acr login --name ${{ env.ACR_NAME }}
