@@ -27,6 +27,10 @@ resource "azurerm_application_insights" "appi" {
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   application_type    = "web"
+
+  lifecycle {
+    ignore_changes = [workspace_id]
+  }
 }
 
 resource "azurerm_key_vault" "kv" {
@@ -43,6 +47,7 @@ resource "azurerm_storage_account" "storage" {
   resource_group_name      = azurerm_resource_group.rg.name
   account_tier             = "Standard"
   account_replication_type = "LRS"
+  shared_access_key_enabled = true
 }
 
 # -----------------------------------------------------------------

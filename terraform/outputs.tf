@@ -12,7 +12,4 @@ output "workspace_name" {
   value = azurerm_machine_learning_workspace.ws.name
 }
 
-output "endpoint_principal_id" {
-  description = "Managed identity principal ID of the online endpoint (useful for debugging role assignments)"
-  value       = azapi_resource.online_endpoint.output.identity.principalId
-}
+
