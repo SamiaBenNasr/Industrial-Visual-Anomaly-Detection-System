@@ -60,6 +60,8 @@ resource "azurerm_machine_learning_workspace" "ws" {
   application_insights_id = azurerm_application_insights.appi.id
   key_vault_id            = azurerm_key_vault.kv.id
   storage_account_id      = azurerm_storage_account.storage.id
+  public_network_access_enabled = true
+
 
   identity {
     type = "SystemAssigned"
