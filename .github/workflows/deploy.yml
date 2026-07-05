@@ -9,13 +9,15 @@ on:
       - 'deployment.yml'
       - 'environment.yml'
       - '.github/workflows/deploy.yml'
-  workflow_dispatch:  
+  workflow_dispatch:
 
 env:
   ACR_NAME: ${{ secrets.ACR_NAME }}
   IMAGE_NAME: patchcore-inference
   RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
   WORKSPACE_NAME: ${{ secrets.WORKSPACE_NAME }}
+  ENDPOINT_NAME: patchcore-endpoint
+  DEPLOYMENT_NAME: patchcore-deploy
 
 jobs:
   build-and-push:
@@ -87,46 +89,44 @@ jobs:
             --workspace-name ${{ env.WORKSPACE_NAME }} \
             --resource-group ${{ env.RESOURCE_GROUP }}
 
+      # ---------- Créer le deployment s'il n'existe pas, sinon le mettre à jour ----------
       - name: Create or update deployment
-  run: |
-    DEPLOYMENT_NAME="patchcore-deploy"
+        run: |
+          if ! az ml online-deployment show --name ${{ env.DEPLOYMENT_NAME }} \
+              --endpoint-name ${{ env.ENDPOINT_NAME }} \
+              --workspace-name ${{ env.WORKSPACE_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "Deployment inexistant -> creation avec tout le trafic"
+            az ml online-deployment create --file deployment.yml \
+              --workspace-name ${{ env.WORKSPACE_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --all-traffic
+          else
+            echo "Deployment existant -> mise a jour"
+            az ml online-deployment update --file deployment.yml \
+              --workspace-name ${{ env.WORKSPACE_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }}
+          fi
 
-    # check if deployment exists
-    EXISTS=$(az ml online-deployment show \
-      --name $DEPLOYMENT_NAME \
-      --endpoint-name patchcore-endpoint \
-      --workspace-name ${{ env.WORKSPACE_NAME }} \
-      --resource-group ${{ env.RESOURCE_GROUP }} \
-      --query name -o tsv 2>/dev/null || echo "")
+      # ---------- Vérifier / forcer le trafic à 100% ----------
+      - name: Ensure traffic is 100% on this deployment
+        run: |
+          az ml online-endpoint update --name ${{ env.ENDPOINT_NAME }} \
+            --workspace-name ${{ env.WORKSPACE_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --traffic "${{ env.DEPLOYMENT_NAME }}=100"
 
-    if [ -z "$EXISTS" ]; then
-      echo "Deployment does not exist → creating..."
-
-      az ml online-deployment create \
-        --file deployment.yml \
-        --workspace-name ${{ env.WORKSPACE_NAME }} \
-        --resource-group ${{ env.RESOURCE_GROUP }} \
-        --all-traffic
-    else
-      echo "Deployment exists → updating..."
-
-      az ml online-deployment update \
-        --file deployment.yml \
-        --workspace-name ${{ env.WORKSPACE_NAME }} \
-        --resource-group ${{ env.RESOURCE_GROUP }}
-    fi
-      - name: Ensure traffic is 100%
-  run: |
-    az ml online-endpoint update \
-      --name patchcore-endpoint \
-      --workspace-name ${{ env.WORKSPACE_NAME }} \
-      --resource-group ${{ env.RESOURCE_GROUP }} \
-      --traffic "patchcore-deploy=100"
+      - name: Confirm traffic
+        run: |
+          az ml online-endpoint show --name ${{ env.ENDPOINT_NAME }} \
+            --workspace-name ${{ env.WORKSPACE_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query traffic
 
       - name: Smoke test the endpoint
         run: |
           az ml online-endpoint invoke \
-            --name patchcore-endpoint \
+            --name ${{ env.ENDPOINT_NAME }} \
             --request-file test-request.json \
             --workspace-name ${{ env.WORKSPACE_NAME }} \
             --resource-group ${{ env.RESOURCE_GROUP }}
