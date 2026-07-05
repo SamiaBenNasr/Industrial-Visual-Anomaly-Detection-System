@@ -10,3 +10,11 @@ outputs/
 
 help/
 hf_cache/
+
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+.terraform.lock.hcl
+*.tfvars
