@@ -2,7 +2,8 @@ $schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.sch
 name: patchcore-deploy
 endpoint_name: patchcore-endpoint
 model: azureml:patchcore-bottle:1
-environment: azureml:patchcore-env@latest
+environment: azureml:patchcore-env:latest
 instance_type: Standard_DS2_v2
 instance_count: 1
 app_insights_enabled: true
+

@@ -1,5 +1,5 @@
 .env
-.env/
+.venv/
 .vscode/
 
 __pycache__/
@@ -18,3 +18,9 @@ hf_cache/
 tfplan
 .terraform.lock.hcl
 *.tfvars
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.tfvars
+crash.log
