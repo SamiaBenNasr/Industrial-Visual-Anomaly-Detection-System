@@ -1,5 +1,6 @@
 name: Build and Deploy PatchCore to Azure ML
 
+
 on:
   push:
     branches: [main]
