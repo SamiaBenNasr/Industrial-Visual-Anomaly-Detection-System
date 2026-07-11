@@ -18,6 +18,26 @@ log = logging.getLogger(__name__)
 os.environ.setdefault("RICH_DISABLE", "1")
 os.environ.setdefault("TQDM_DISABLE", "1")
 
+# ── MLflow ────────────────────────────────────────────────────────────────────
+# Quand ce script tourne comme Azure ML job (job.yml), MLFLOW_TRACKING_URI
+# est injecté automatiquement par le compute -> mlflow.start_run() s'attache
+# tout seul au workspace, sans configuration supplementaire.
+# En local (hors job), mlflow log en local (./mlruns) si aucune tracking URI
+# n'est definie -- ca ne casse rien, ca permet juste de tester le script.
+import mlflow
+import azureml.mlflow
+
+
+def _flatten_metrics(metrics: dict) -> dict:
+    """Ne garde que les valeurs numeriques loggables par mlflow.log_metrics."""
+    flat = {}
+    for k, v in metrics.items():
+        try:
+            flat[k] = float(v)
+        except (TypeError, ValueError):
+            log.warning("Metric '%s' non numerique, ignoree pour MLflow (%r)", k, v)
+    return flat
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PatchCore anomaly detector")
@@ -30,7 +50,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbors",     type=int, default=6,  help="PatchCore num_neighbors")
     parser.add_argument("--export-format", default="onnx",
                         choices=["onnx", "torch", "openvino"])
+    parser.add_argument("--run-name", default=None,
+                        help="Nom du run MLflow (defaut: auto-genere)")
+    parser.add_argument("--experiment-name", default="patchcore-anomaly-detection",
+                        help="Nom de l'experiment MLflow/Azure ML")
+    parser.add_argument("--subscription-id", default=os.getenv("AZURE_SUBSCRIPTION_ID"),
+                        help="Optionnel: connecte MLflow au workspace Azure ML (tracking distant, "
+                             "sans compute). Omets ces 3 args pour rester en tracking local (./mlruns).")
+    parser.add_argument("--resource-group", default=os.getenv("AZURE_RESOURCE_GROUP"))
+    parser.add_argument("--workspace-name", default=os.getenv("AZURE_WORKSPACE_NAME"))
     return parser.parse_args()
+
+
+def _maybe_connect_azureml_tracking(args: argparse.Namespace) -> None:
+    """Si les 3 identifiants workspace sont fournis, pointe MLflow vers le
+    tracking server Azure ML -- les runs apparaissent alors dans
+    ml.azure.com > Jobs > All experiments, MEME si l'entrainement tourne
+    sur ce PC et pas sur un compute Azure ML. Aucun job/compute requis :
+    c'est juste le tracking (ecriture de metriques/artefacts) qui vise
+    le workspace au lieu d'un dossier local.
+    Sans ces identifiants, mlflow reste en tracking local (./mlruns).
+    """
+    if not (args.subscription_id and args.resource_group and args.workspace_name):
+        log.info("Pas d'identifiants Azure ML fournis -> tracking MLflow local (./mlruns).")
+        return
+
+    try:
+        from azure.ai.ml import MLClient
+        from azure.identity import DefaultAzureCredential
+
+        ml_client = MLClient(
+            credential=DefaultAzureCredential(),
+            subscription_id=args.subscription_id,
+            resource_group_name=args.resource_group,
+            workspace_name=args.workspace_name,
+        )
+        tracking_uri = ml_client.workspaces.get(args.workspace_name).mlflow_tracking_uri
+        mlflow.set_tracking_uri(tracking_uri)
+        log.info("MLflow connecte au workspace Azure ML '%s' (tracking distant, sans compute).",
+                  args.workspace_name)
+    except Exception as e:
+        log.warning("Impossible de se connecter au tracking Azure ML (%s). "
+                    "Fallback sur le tracking local (./mlruns).", e)
 
 
 def image_item_collate(batch):
@@ -65,6 +126,30 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    _maybe_connect_azureml_tracking(args)
+    mlflow.set_experiment(args.experiment_name)
+    with mlflow.start_run(run_name=args.run_name) as run:
+        run_id = run.info.run_id
+        log.info("MLflow run_id: %s", run_id)
+
+        mlflow.log_params({
+            "category":      args.category,
+            "epochs":        args.epochs,
+            "train_batch":   args.train_batch,
+            "eval_batch":    args.eval_batch,
+            "neighbors":     args.neighbors,
+            "export_format": args.export_format,
+        })
+
+        _train_and_evaluate(args, output_dir)
+
+        # run_id.txt permet au job CI (train-and-register) de recuperer
+        # le run sans parser les logs stdout.
+        (output_dir / "run_id.txt").write_text(run_id)
+        mlflow.log_artifact(str(output_dir / "run_id.txt"))
+
+
+def _train_and_evaluate(args: argparse.Namespace, output_dir: Path) -> None:
     from anomalib.data.datasets.image.mvtecad import (
         MVTecADDataset,
         make_mvtec_ad_dataset,
@@ -156,6 +241,9 @@ def main() -> None:
     metrics_path.write_text(json.dumps(metrics, indent=2))
     log.info("Metrics saved → %s", metrics_path)
 
+    mlflow.log_metrics(_flatten_metrics(metrics))
+    mlflow.log_artifact(str(metrics_path))
+
     # ── Export ────────────────────────────────────────────────────────────────
     log.info("Exporting model as %s …", args.export_format.upper())
     engine.export(
@@ -164,6 +252,20 @@ def main() -> None:
         export_root=str(output_dir / "export"),
     )
     log.info("Export complete → %s/export", output_dir)
+
+    # ── Checkpoint & artefacts export dans MLflow ────────────────────────────
+    # Le .ckpt (repris tel quel par endpoint_score.py) est sous
+    # output_dir/Patchcore/<category>/.../weights/lightning/model.ckpt
+    ckpt_candidates = list(output_dir.rglob("*.ckpt"))
+    if ckpt_candidates:
+        mlflow.log_artifact(str(ckpt_candidates[0]), artifact_path="checkpoint")
+        log.info("Checkpoint logge dans MLflow: %s", ckpt_candidates[0])
+    else:
+        log.warning("Aucun .ckpt trouve sous %s, rien a logger comme checkpoint", output_dir)
+
+    export_dir = output_dir / "export"
+    if export_dir.exists():
+        mlflow.log_artifacts(str(export_dir), artifact_path="export")
 
 
 if __name__ == "__main__":
