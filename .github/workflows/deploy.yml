@@ -7,7 +7,6 @@ on:
       - 'docker/Dockerfile'
       - 'score.py'
       - 'deployment.yml'
-      - 'environment.yml'
       - 'endpoint_score.py'
       - 'server.py'
       - 'tests/**'

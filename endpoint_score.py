@@ -1,13 +1,13 @@
 """
-endpoint_score.py 
+endpoint_score.py
 
 Payload JSON attendu:
 {
   "image_b64": "<base64-encoded PNG/JPEG>",
-  "image_size": [256, 256]          // optionnel, défaut 256x256
+  "image_size": [256, 256]          // optionnel, defaut 256x256
 }
 
-Réponse JSON:
+Reponse JSON:
 {
   "pred_score": 0.312,
   "pred_label": 0,
@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -28,14 +29,14 @@ import numpy as np
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
-# Globals initialisés dans init()
+# Globals initialises dans init()
 _engine = None
 _model  = None
 _ckpt   = None
 
 
 def init() -> None:
-    """Appelé une fois au démarrage — charge le modèle en mémoire."""
+    """Appele une fois au demarrage - charge le modele en memoire."""
     global _engine, _model, _ckpt
 
     import os
@@ -45,7 +46,6 @@ def init() -> None:
     from anomalib.engine import Engine
     from anomalib.models import Patchcore
 
-    # Azure ML monte le modèle enregistré dans AZUREML_MODEL_DIR
     model_dir = os.getenv("AZUREML_MODEL_DIR", ".")
     ckpt_candidates = list(Path(model_dir).rglob("*.ckpt"))
 
@@ -59,17 +59,33 @@ def init() -> None:
     log.info("Model loaded from: %s", _ckpt)
 
 
+def _image_quality_checks(pil_image) -> dict:
+    """Signal type 2: basic input data quality checks, logged as custom
+    metrics. Catches corrupt uploads, wrong resolution cameras, all-black
+    frames (lens cap / camera offline), etc. -- issues that would otherwise
+    silently degrade predictions without ever showing up as an HTTP error."""
+    arr = np.array(pil_image.convert("L"))  # grayscale for quick stats
+    return {
+        "width": pil_image.width,
+        "height": pil_image.height,
+        "mean_brightness": float(arr.mean()),
+        "std_brightness": float(arr.std()),
+        "is_near_blank": bool(arr.std() < 2.0),  # near-uniform image = likely bad capture
+    }
+
+
 def run(raw_data: str) -> str:
-    """Appelé à chaque requête POST."""
+    """Appele a chaque requete POST."""
     from anomalib.data import PredictDataset
     from PIL import Image
+
+    start = time.time()
 
     try:
         payload = json.loads(raw_data)
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"Invalid JSON: {e}"})
 
-    # ── Décoder l'image ───────────────────────────────────────────────────────
     image_b64 = payload.get("image_b64")
     if not image_b64:
         return json.dumps({"error": "Missing 'image_b64' field"})
@@ -82,13 +98,16 @@ def run(raw_data: str) -> str:
 
     image_size = tuple(payload.get("image_size", [256, 256]))
 
-    # Sauvegarder temporairement (PredictDataset lit depuis le disque)
-    # Use tempfile for cross-platform compatibility (Windows doesn't have /tmp)
+    # ---- Signal 2: data quality checks, logged regardless of prediction outcome ----
+    quality = _image_quality_checks(pil_image)
+    if quality["is_near_blank"]:
+        log.warning("INPUT_QUALITY_FLAG near_blank_image width=%s height=%s std=%s",
+                    quality["width"], quality["height"], quality["std_brightness"])
+
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     pil_image.save(tmp_path)
 
-    # ── Inférence ─────────────────────────────────────────────────────────────
     try:
         dataset = PredictDataset(path=str(tmp_path), image_size=image_size)
         predictions = _engine.predict(
@@ -108,16 +127,24 @@ def run(raw_data: str) -> str:
     label = int(pred.pred_label.item()) if hasattr(pred.pred_label, "item") \
             else int(pred.pred_label)
 
+    latency_ms = (time.time() - start) * 1000
+
+    
+    log.info(
+        "PREDICTION_METRIC pred_score=%.6f pred_label=%d is_anomalous=%s "
+        "latency_ms=%.1f mean_brightness=%.2f",
+        score, label, bool(label), latency_ms, quality["mean_brightness"],
+    )
+
     result = {
         "pred_score":   round(score, 6),
         "pred_label":   label,
         "is_anomalous": bool(label),
     }
-    
-    # Clean up temporary file
+
     try:
         tmp_path.unlink()
     except Exception as e:
         log.warning("Could not delete temp file: %s", e)
-    
+
     return json.dumps(result)
