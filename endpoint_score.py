@@ -1,9 +1,5 @@
 """
-endpoint_score.py — Script de scoring appelé par Azure ML Managed Online Endpoint.
-
-Azure ML appelle :
-  - init()  : une seule fois au démarrage du pod
-  - run(raw_data) : à chaque requête HTTP POST
+endpoint_score.py 
 
 Payload JSON attendu:
 {

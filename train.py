@@ -18,12 +18,6 @@ log = logging.getLogger(__name__)
 os.environ.setdefault("RICH_DISABLE", "1")
 os.environ.setdefault("TQDM_DISABLE", "1")
 
-# ── MLflow ────────────────────────────────────────────────────────────────────
-# Quand ce script tourne comme Azure ML job (job.yml), MLFLOW_TRACKING_URI
-# est injecté automatiquement par le compute -> mlflow.start_run() s'attache
-# tout seul au workspace, sans configuration supplementaire.
-# En local (hors job), mlflow log en local (./mlruns) si aucune tracking URI
-# n'est definie -- ca ne casse rien, ca permet juste de tester le script.
 import mlflow
 import azureml.mlflow
 
@@ -254,8 +248,6 @@ def _train_and_evaluate(args: argparse.Namespace, output_dir: Path) -> None:
     log.info("Export complete → %s/export", output_dir)
 
     # ── Checkpoint & artefacts export dans MLflow ────────────────────────────
-    # Le .ckpt (repris tel quel par endpoint_score.py) est sous
-    # output_dir/Patchcore/<category>/.../weights/lightning/model.ckpt
     ckpt_candidates = list(output_dir.rglob("*.ckpt"))
     if ckpt_candidates:
         mlflow.log_artifact(str(ckpt_candidates[0]), artifact_path="checkpoint")

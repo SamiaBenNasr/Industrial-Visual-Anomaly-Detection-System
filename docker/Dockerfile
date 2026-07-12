@@ -38,11 +38,7 @@ RUN find /usr/local -name '*.pyc' -delete \
  && find /usr/local -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true \
  && find /usr/local/lib/python3.11/site-packages -name 'tests' -type d -exec rm -rf {} + 2>/dev/null || true
 
-# Download the backbone weights at build time by instantiating Patchcore()
-# exactly as done locally. This works regardless of whether timm resolves
-# the weights via torch.hub or the HuggingFace Hub under the hood --
-# we don't need to guess a repo_id, we just capture whatever cache dirs
-# get populated.
+
 ENV TORCH_HOME=/app/.cache/torch \
     HF_HOME=/app/.cache/hf \
     HF_HUB_OFFLINE=0
